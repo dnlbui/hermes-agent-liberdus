@@ -109,6 +109,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    LIBERDUS = "liberdus"
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -385,6 +386,35 @@ class StreamingConfig:
 # -----------------------------------------------------------------------------
 # Built-in platform connection checkers
 # -----------------------------------------------------------------------------
+def _is_loopback_http_url(value: Any) -> bool:
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(str(value or ""))
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+
+
+def _liberdus_configured(cfg: PlatformConfig) -> bool:
+    """Liberdus is usable only through exactly one local dev daemon endpoint."""
+    extra = cfg.extra or {}
+    api_url = str(extra.get("api_url") or "").strip()
+    api_socket = str(extra.get("api_socket") or "").strip()
+    if bool(api_url) == bool(api_socket):
+        return False
+    if str(extra.get("network_profile") or "dev").strip().lower() != "dev":
+        return False
+    if not str(extra.get("api_token") or "").strip():
+        return False
+    if api_url:
+        return _is_loopback_http_url(api_url)
+    return api_socket.startswith("/")
+
+
 # Each callable receives a ``PlatformConfig`` and returns ``True`` when the
 # platform is sufficiently configured to be considered "connected".  Platforms
 # that rely on the generic ``token or api_key`` check (Telegram, Discord,
@@ -414,6 +444,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.YUANBAO: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("app_secret")
     ),
+    Platform.LIBERDUS: _liberdus_configured,
     Platform.DINGTALK: lambda cfg: bool(
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
@@ -1294,6 +1325,32 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=signal_home,
             name=os.getenv("SIGNAL_HOME_CHANNEL_NAME", "Home"),
             thread_id=os.getenv("SIGNAL_HOME_CHANNEL_THREAD_ID") or None,
+        )
+
+    # Liberdus (local liberdusd daemon, dev network only)
+    liberdus_enabled = os.getenv("LIBERDUS_ENABLED", "").lower() in ("true", "1", "yes", "on")
+    liberdus_disabled = os.getenv("LIBERDUS_ENABLED", "").lower() in ("false", "0", "no", "off")
+    if liberdus_disabled and Platform.LIBERDUS in config.platforms:
+        config.platforms[Platform.LIBERDUS].enabled = False
+    elif liberdus_enabled:
+        try:
+            from gateway.platforms.liberdus import liberdus_env_config
+            liberdus_extra = liberdus_env_config()
+        except Exception as e:
+            logger.debug("Liberdus env parsing failed: %s", e)
+            liberdus_extra = None
+        if liberdus_extra:
+            if Platform.LIBERDUS not in config.platforms:
+                config.platforms[Platform.LIBERDUS] = PlatformConfig()
+            config.platforms[Platform.LIBERDUS].enabled = True
+            config.platforms[Platform.LIBERDUS].extra.update(liberdus_extra)
+    liberdus_home = os.getenv("LIBERDUS_HOME_CHANNEL")
+    if liberdus_home and Platform.LIBERDUS in config.platforms:
+        config.platforms[Platform.LIBERDUS].home_channel = HomeChannel(
+            platform=Platform.LIBERDUS,
+            chat_id=liberdus_home,
+            name=os.getenv("LIBERDUS_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("LIBERDUS_HOME_CHANNEL_THREAD_ID") or None,
         )
 
     # Mattermost

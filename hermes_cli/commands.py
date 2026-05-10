@@ -193,7 +193,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
-               cli_only=True, aliases=("gateway",)),
+               aliases=("gateway",)),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]"),
     CommandDef("paste", "Attach clipboard image from your clipboard", "Info",
