@@ -568,6 +568,17 @@ from gateway.restart import (
 )
 
 
+def _apply_liberdus_session_tool_boundary(source: SessionSource, enabled_toolsets: list[str]) -> list[str]:
+    """Disable Hermes tools for restricted Liberdus test contacts at agent creation time."""
+    if source.platform != Platform.LIBERDUS:
+        return enabled_toolsets
+    policy = str(getattr(source, "chat_topic", None) or "").strip().lower()
+    user_name = str(getattr(source, "user_name", None) or "").strip().lower()
+    if policy == "restricted-chat-only" or user_name == "test":
+        return []
+    return enabled_toolsets
+
+
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -4555,6 +4566,13 @@ class GatewayRunner:
                 return None
             return SignalAdapter(config)
 
+        elif platform == Platform.LIBERDUS:
+            from gateway.platforms.liberdus import LiberdusAdapter, check_liberdus_requirements
+            if not check_liberdus_requirements():
+                logger.warning("Liberdus: httpx dependency unavailable")
+                return None
+            return LiberdusAdapter(config)
+
         elif platform == Platform.HOMEASSISTANT:
             from gateway.platforms.homeassistant import HomeAssistantAdapter, check_ha_requirements
             if not check_ha_requirements():
@@ -4693,6 +4711,12 @@ class GatewayRunner:
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
         if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+            return True
+
+        # Liberdus authentication and contact policy is enforced by the local
+        # liberdusd redacted API: dbp/test are surfaced, unknown/quarantined
+        # contacts are not emitted into the normal Hermes feed.
+        if source.platform == Platform.LIBERDUS:
             return True
 
         user_id = source.user_id
@@ -5666,6 +5690,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "platforms":
+            return await self._handle_platforms_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -7635,6 +7662,68 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    async def _handle_platforms_command(self, event: MessageEvent) -> str:
+        """Handle /platforms (/gateway): show configured and runtime platform state."""
+        config = getattr(self, "config", None)
+        configured = dict(getattr(config, "platforms", {}) or {})
+        adapters = dict(getattr(self, "adapters", {}) or {})
+        failed = dict(getattr(self, "_failed_platforms", {}) or {})
+
+        def _name(platform: Any) -> str:
+            return getattr(platform, "value", str(platform))
+
+        all_platforms = set(configured.keys()) | set(adapters.keys()) | set(failed.keys())
+        rows: list[tuple[str, str, str]] = []
+        for platform in sorted(all_platforms, key=_name):
+            platform_config = configured.get(platform)
+            enabled = bool(getattr(platform_config, "enabled", False)) if platform_config is not None else False
+            try:
+                config_ready = bool(
+                    enabled
+                    and config is not None
+                    and platform_config is not None
+                    and config._is_platform_connected(platform, platform_config)
+                )
+            except Exception:
+                config_ready = False
+
+            adapter = adapters.get(platform)
+            if adapter is not None and getattr(adapter, "is_connected", True):
+                state = "connected"
+                detail = "runtime adapter active"
+            elif platform in failed:
+                state = "retrying"
+                error = failed[platform].get("error") or failed[platform].get("error_message")
+                attempts = failed[platform].get("attempts")
+                detail = f"attempts={attempts}" if attempts is not None else "connection failed"
+                if error:
+                    detail = f"{detail}; {error}"
+            elif enabled and config_ready:
+                state = "configured, disconnected"
+                detail = "restart gateway or check runtime health"
+            elif enabled:
+                state = "misconfigured"
+                detail = "missing or invalid required settings"
+            else:
+                state = "disabled"
+                detail = "not enabled"
+            rows.append((_name(platform), state, detail))
+
+        connected = [name for name, state, _detail in rows if state == "connected"]
+        lines = [
+            "🛰️ **Hermes Gateway Platforms**",
+            "",
+            f"**Connected:** {', '.join(connected) if connected else 'none'}",
+        ]
+        if rows:
+            lines.extend(["", "**Platform Status:**"])
+            for name, state, detail in rows:
+                lines.append(f"- `{name}`: {state} — {detail}")
+        else:
+            lines.extend(["", "No platforms are configured. Run `hermes gateway setup` in your terminal."])
+
+        return "\n".join(lines)
+
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
         from tools.process_registry import format_uptime_short, process_registry
@@ -9393,6 +9482,7 @@ class GatewayRunner:
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _apply_liberdus_session_tool_boundary(source, enabled_toolsets)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -13210,6 +13300,7 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _apply_liberdus_session_tool_boundary(source, enabled_toolsets)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
