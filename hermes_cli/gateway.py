@@ -3202,6 +3202,35 @@ _PLATFORMS = [
         ],
     },
     {
+        "key": "liberdus",
+        "label": "Liberdus",
+        "emoji": "🗽",
+        "token_var": "LIBERDUS_ENABLED",
+        "setup_instructions": [
+            "1. Start the local liberdusd daemon from the Liberdus CLI project",
+            "2. Use the dev network only (liberdus.com/dev / dev.liberdus.com)",
+            "3. Expose only the daemon's redacted local API; Hermes never receives keys, seeds, passphrases, or signed txs",
+            "4. Configure exactly one local endpoint below: HTTP URL or Unix socket",
+            "5. Restart the gateway after changing Liberdus settings",
+        ],
+        "vars": [
+            {"name": "LIBERDUS_ENABLED", "prompt": "Enable Liberdus? (true/false)", "password": False,
+             "help": "Set to true to let Hermes Gateway connect to a local liberdusd daemon."},
+            {"name": "LIBERDUS_API_URL", "prompt": "Local liberdusd HTTP URL (e.g. http://127.0.0.1:9484, or empty if using socket)", "password": False,
+             "help": "Loopback-only daemon URL. Do not use a public Liberdus endpoint here."},
+            {"name": "LIBERDUS_API_SOCKET", "prompt": "Local liberdusd Unix socket path (or empty if using HTTP URL)", "password": False,
+             "help": "Absolute socket path. Leave empty when LIBERDUS_API_URL is set."},
+            {"name": "LIBERDUS_NETWORK_PROFILE", "prompt": "Network profile (must be dev)", "password": False,
+             "help": "Liberdus Gateway support is restricted to the dev network."},
+            {"name": "LIBERDUS_HOME_CHANNEL", "prompt": "Home channel (Liberdus chat/account label for cron delivery, or empty)", "password": False,
+             "help": "Optional Liberdus destination for scheduled results and notifications."},
+            {"name": "LIBERDUS_POLL_INTERVAL_MS", "prompt": "Poll interval in milliseconds (default 15000)", "password": False,
+             "help": "How often Hermes asks liberdusd for redacted inbound events."},
+            {"name": "LIBERDUS_EVENTS_PAGE_SIZE", "prompt": "Events page size (default 50)", "password": False,
+             "help": "Maximum redacted events Hermes requests per daemon poll."},
+        ],
+    },
+    {
         "key": "qqbot",
         "label": "QQ Bot",
         "emoji": "🐧",
@@ -3329,6 +3358,30 @@ def _platform_status(platform: dict) -> str:
         if val or account:
             return "partially configured"
         return "not configured"
+    if platform.get("key") == "liberdus":
+        enabled = str(val or "").strip().lower() in {"1", "true", "yes", "on"}
+        api_url = (get_env_value("LIBERDUS_API_URL") or "").strip()
+        api_socket = (get_env_value("LIBERDUS_API_SOCKET") or "").strip()
+        network = (get_env_value("LIBERDUS_NETWORK_PROFILE") or "dev").strip().lower()
+        endpoint_count = int(bool(api_url)) + int(bool(api_socket))
+        url_is_local = False
+        if api_url:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(api_url)
+                url_is_local = parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in {
+                    "127.0.0.1",
+                    "localhost",
+                    "::1",
+                }
+            except Exception:
+                url_is_local = False
+        endpoint_valid = (bool(api_url) and url_is_local) or (bool(api_socket) and api_socket.startswith("/"))
+        if enabled and endpoint_count == 1 and network == "dev" and endpoint_valid:
+            return "configured"
+        if enabled or endpoint_count or network != "dev":
+            return "partially configured"
+        return "not configured"
     if platform.get("key") == "email":
         pwd = get_env_value("EMAIL_PASSWORD")
         imap = get_env_value("EMAIL_IMAP_HOST")
@@ -3379,9 +3432,18 @@ def _runtime_health_lines() -> list[str]:
     platforms = state.get("platforms", {}) or {}
 
     for platform, pdata in platforms.items():
-        if pdata.get("state") == "fatal":
-            message = pdata.get("error_message") or "unknown error"
+        state = str(pdata.get("state") or "").strip().lower()
+        message = pdata.get("error_message") or pdata.get("error_code") or "unknown error"
+        if state == "connected":
+            lines.append(f"✓ {platform}: connected")
+        elif state == "connecting":
+            lines.append(f"⏳ {platform}: connecting")
+        elif state == "retrying":
+            lines.append(f"⚠ {platform}: retrying ({message})")
+        elif state == "fatal":
             lines.append(f"⚠ {platform}: {message}")
+        elif state:
+            lines.append(f"• {platform}: {state}")
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")
