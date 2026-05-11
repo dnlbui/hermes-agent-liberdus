@@ -20,15 +20,21 @@ from urllib.parse import urlencode, urlparse
 import httpx
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_MS = 15000
-MIN_POLL_INTERVAL_MS = 2000
+MIN_POLL_INTERVAL_MS = 500
 DEFAULT_EVENTS_PAGE_SIZE = 50
 MAX_EVENTS_PAGE_SIZE = 100
+LIBERDUS_OUTBOUND_MESSAGE_MAX_BYTES = 1000
+
+_PROCESSING_REACTION = "👀"
+_SUCCESS_REACTION = "✅"
+_FAILURE_REACTION = "❌"
+_CANCELLED_REACTION = "❌"
 
 _ALLOWED_PROFILES = {"dbp", "test"}
 _ALLOWED_POLICY_MODES = {"full", "restricted-chat-only"}
@@ -201,6 +207,148 @@ def _error_message(payload: Any, fallback: str) -> str:
         if isinstance(message, str) and message.strip():
             return message.strip()
     return _scrub_text(fallback)
+
+
+def _daemon_error_code(payload: Any) -> str:
+    safe = _safe_payload(payload)
+    if isinstance(safe, dict):
+        err = safe.get("error")
+        if isinstance(err, dict):
+            code = str(err.get("code") or "").strip()
+            if code:
+                return code
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+        code = safe.get("code")
+        if isinstance(code, str) and code.strip():
+            return code.strip()
+    return "unknown"
+
+
+def _log_value(value: Any, *, limit: int = 240) -> str:
+    text = _scrub_text(str(value or "")).replace("\n", " ").replace("\r", " ").strip()
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _plaintext_log_summary(message: str) -> dict[str, Any]:
+    scrubbed_preview = _log_value(message, limit=120)
+    return {
+        "bytes": len(message.encode("utf-8")),
+        "sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "preview": scrubbed_preview,
+    }
+
+
+def _utf8_prefix_len(text: str, byte_limit: int) -> int:
+    """Return a string index that fits inside byte_limit without splitting codepoints."""
+    used = 0
+    for index, char in enumerate(text):
+        used += len(char.encode("utf-8"))
+        if used > byte_limit:
+            return index
+    return len(text)
+
+
+def _split_utf8_text(text: str, byte_limit: int) -> list[str]:
+    """Split text into non-empty UTF-8 byte-bounded chunks."""
+    if byte_limit <= 0:
+        raise ValueError("byte_limit must be positive")
+    remaining = text
+    chunks: list[str] = []
+    while remaining:
+        if len(remaining.encode("utf-8")) <= byte_limit:
+            chunks.append(remaining)
+            break
+        hard_end = _utf8_prefix_len(remaining, byte_limit)
+        if hard_end <= 0:
+            # Defensive fallback for pathological limits; callers use much larger limits.
+            hard_end = 1
+        split_at = hard_end
+        soft_window = remaining[:hard_end]
+        # Prefer natural boundaries near the end of the chunk, but do not create tiny fragments.
+        for pattern in ("\n\n", "\n", ". ", "! ", "? ", " "):
+            candidate = soft_window.rfind(pattern)
+            if candidate >= max(1, hard_end // 2):
+                split_at = candidate + len(pattern)
+                break
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:hard_end]
+            split_at = hard_end
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    return chunks
+
+
+def _split_liberdus_outbound_message(message: str, *, max_bytes: int = LIBERDUS_OUTBOUND_MESSAGE_MAX_BYTES) -> list[str]:
+    """Return web-client-compatible outbound Liberdus chunks.
+
+    liberdusd enforces the web-client-v2 plaintext limit before accepting
+    /send-requests.  The Gateway must therefore split long replies before POSTing
+    them.  Multi-part replies include a small ordering prefix that is counted
+    against the same byte limit.
+    """
+    if len(message.encode("utf-8")) <= max_bytes:
+        return [message]
+
+    digit_count = 1
+    for _ in range(8):
+        worst_prefix = f"({str(9) * digit_count}/{str(9) * digit_count})\n"
+        payload_limit = max_bytes - len(worst_prefix.encode("utf-8"))
+        if payload_limit <= 0:
+            raise ValueError("max_bytes too small for Liberdus chunk prefix")
+        raw_chunks = _split_utf8_text(message, payload_limit)
+        needed_digits = len(str(len(raw_chunks)))
+        if needed_digits == digit_count:
+            break
+        digit_count = needed_digits
+    else:
+        raw_chunks = _split_utf8_text(message, max_bytes - 32)
+
+    total = len(raw_chunks)
+    chunks = [f"({index}/{total})\n{chunk}" for index, chunk in enumerate(raw_chunks, start=1)]
+    if any(len(chunk.encode("utf-8")) > max_bytes for chunk in chunks):
+        # Final defensive pass using the exact largest prefix for this total.
+        worst_prefix = f"({total}/{total})\n"
+        payload_limit = max_bytes - len(worst_prefix.encode("utf-8"))
+        raw_chunks = _split_utf8_text(message, payload_limit)
+        total = len(raw_chunks)
+        chunks = [f"({index}/{total})\n{chunk}" for index, chunk in enumerate(raw_chunks, start=1)]
+    return chunks
+
+
+def _log_send_failure(
+    *,
+    status_code: Any,
+    payload: Any,
+    request: dict[str, Any],
+    message: str,
+    fallback: str,
+    retryable: bool,
+) -> None:
+    plaintext = _plaintext_log_summary(message)
+    client_context = request.get("clientContext") if isinstance(request.get("clientContext"), dict) else {}
+    logger.warning(
+        "Liberdus send request rejected: "
+        "http_status=%s daemon_code=%s daemon_error=%s retryable=%s "
+        "action=%s account_id=%s chat_id=%s contact_id=%s adapter_request_id=%s reply_to=%s "
+        "plaintext_bytes=%s plaintext_sha256=%s plaintext_preview=%r",
+        _log_value(status_code, limit=40),
+        _log_value(_daemon_error_code(payload), limit=120),
+        _log_value(_error_message(payload, fallback), limit=240),
+        bool(retryable),
+        _log_value(request.get("action"), limit=80),
+        _log_value(request.get("accountId"), limit=120),
+        _log_value(request.get("chatId"), limit=120),
+        _log_value(request.get("contactId"), limit=120),
+        _log_value(client_context.get("adapterRequestId"), limit=120),
+        _log_value(client_context.get("replyToEventId"), limit=120),
+        plaintext["bytes"],
+        plaintext["sha256"],
+        plaintext["preview"],
+    )
 
 
 def check_liberdus_requirements() -> bool:
@@ -395,48 +543,148 @@ class LiberdusAdapter(BasePlatformAdapter):
         if action not in {"send-message", "reply-test"}:
             return SendResult(success=False, error="policy_denied: outbound action unavailable")
 
+        chunks = _split_liberdus_outbound_message(message)
+        original_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        raw_responses: list[Any] = []
+        handles: list[str] = []
+        request: dict[str, Any] = {}
+
+        try:
+            for index, chunk in enumerate(chunks, start=1):
+                request = {
+                    "schemaVersion": 1,
+                    "accountId": session.get("accountId"),
+                    "chatId": session.get("chatId"),
+                    "contactId": session.get("contactId"),
+                    "counterpartyProfile": profile,
+                    "action": action,
+                    "message": chunk,
+                    "clientContext": {
+                        "platform": "liberdus",
+                        "adapterRequestId": _stable_adapter_request_id(session, str(action), chunk, f"{reply_to}:chunk:{index}" if len(chunks) > 1 else reply_to),
+                        "replyToEventId": reply_to,
+                        "policyMode": policy_mode,
+                    },
+                }
+                if len(chunks) > 1:
+                    request["clientContext"]["chunk"] = {
+                        "index": index,
+                        "total": len(chunks),
+                        "originalPlaintextSha256": original_hash,
+                    }
+                if metadata:
+                    request["clientContext"]["metadata"] = _safe_payload(metadata)
+
+                response = await self.client.post("/send-requests", json=request, headers=self._auth_headers())
+                try:
+                    payload = response.json()
+                except Exception as exc:
+                    payload = {"ok": False, "error": {"code": "invalid_daemon_response", "message": _scrub_text(str(exc))}}
+                safe_response = _safe_payload(payload)
+                raw_responses.append(safe_response)
+                status_code = getattr(response, "status_code", 200)
+                if status_code >= 400 or not payload.get("ok", True) or payload.get("accepted") is False:
+                    fallback = f"liberdusd send rejected with HTTP {status_code}"
+                    _log_send_failure(
+                        status_code=status_code,
+                        payload=payload,
+                        request=request,
+                        message=chunk,
+                        fallback=fallback,
+                        retryable=False,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=_error_message(payload, fallback),
+                        raw_response=safe_response,
+                        retryable=False,
+                    )
+                acceptance = payload.get("gatewayAcceptance") if isinstance(payload, dict) else None
+                handle = acceptance.get("handle") if isinstance(acceptance, dict) else None
+                handle = str(handle or payload.get("messageId") or payload.get("txid") or "")
+                if handle:
+                    handles.append(handle)
+            return SendResult(
+                success=True,
+                message_id=handles[-1] if handles else "",
+                raw_response=raw_responses[-1] if len(raw_responses) == 1 else {"ok": True, "chunks": raw_responses},
+            )
+        except (httpx.ConnectError, httpx.TransportError) as exc:
+            payload = {"ok": False, "error": {"code": "daemon_unavailable", "message": _scrub_text(str(exc))}}
+            _log_send_failure(
+                status_code="transport_error",
+                payload=payload,
+                request=request,
+                message=message,
+                fallback="liberdusd unavailable",
+                retryable=True,
+            )
+            return SendResult(success=False, error=f"liberdusd unavailable: {_scrub_text(str(exc))}", retryable=True)
+        except Exception as exc:
+            payload = {"ok": False, "error": {"code": "send_failed", "message": _scrub_text(str(exc))}}
+            _log_send_failure(
+                status_code="exception",
+                payload=payload,
+                request=request,
+                message=message,
+                fallback="liberdusd send failed",
+                retryable=False,
+            )
+            return SendResult(success=False, error=f"liberdusd send failed: {_scrub_text(str(exc))}", retryable=False)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Set a Liberdus processing reaction on the source message."""
+        await self._send_processing_reaction(event, _PROCESSING_REACTION)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Replace the processing reaction with a final success/failure marker."""
+        if outcome == ProcessingOutcome.SUCCESS:
+            emoji = _SUCCESS_REACTION
+        elif outcome == ProcessingOutcome.CANCELLED:
+            emoji = _CANCELLED_REACTION
+        else:
+            emoji = _FAILURE_REACTION
+        await self._send_processing_reaction(event, emoji)
+
+    async def _send_processing_reaction(self, event: MessageEvent, emoji: str) -> None:
+        """Ask liberdusd to submit a web-client-v2-compatible reaction control message.
+
+        Liberdus web-client-v2 models reactions as encrypted structured `message`
+        tx payloads containing reactId/reactAction/reactMessage.  The adapter
+        only sends redacted metadata to the local daemon; liberdusd owns signing,
+        encryption, and devnet submission.  Failures are intentionally soft so a
+        missing/older daemon reaction route cannot break normal message handling.
+        """
+        if not self.client or not self.is_connected:
+            return
+        session = self._sessions.get(str(event.source.chat_id))
+        if not session or session.get("policyMode") == "quarantine":
+            return
+        react_id = str(session.get("lastReactionTarget") or event.message_id or "").strip()
+        if not react_id:
+            return
         request = {
             "schemaVersion": 1,
             "accountId": session.get("accountId"),
             "chatId": session.get("chatId"),
             "contactId": session.get("contactId"),
-            "counterpartyProfile": profile,
-            "action": action,
-            "message": message,
+            "counterpartyProfile": session.get("counterpartyProfile"),
+            "reactId": react_id,
+            "reactAction": "set",
+            "reactMessage": emoji,
             "clientContext": {
                 "platform": "liberdus",
-                "adapterRequestId": _stable_adapter_request_id(session, str(action), message, reply_to),
-                "replyToEventId": reply_to,
-                "policyMode": policy_mode,
+                "lifecycle": "processing",
+                "replyToEventId": event.message_id,
+                "policyMode": session.get("policyMode"),
             },
         }
-        if metadata:
-            request["clientContext"]["metadata"] = _safe_payload(metadata)
-
         try:
-            response = await self.client.post("/send-requests", json=request, headers=self._auth_headers())
-            payload = response.json()
-            safe_response = _safe_payload(payload)
-            if getattr(response, "status_code", 200) >= 400 or not payload.get("ok", True) or payload.get("accepted") is False:
-                return SendResult(
-                    success=False,
-                    error=_error_message(payload, f"liberdusd send rejected with HTTP {getattr(response, 'status_code', 'unknown')}"),
-                    raw_response=safe_response,
-                    retryable=False,
-                )
-            handle = None
-            acceptance = payload.get("gatewayAcceptance") if isinstance(payload, dict) else None
-            if isinstance(acceptance, dict):
-                handle = acceptance.get("handle")
-            return SendResult(
-                success=True,
-                message_id=str(handle or payload.get("messageId") or payload.get("txid") or ""),
-                raw_response=safe_response,
-            )
-        except (httpx.ConnectError, httpx.TransportError) as exc:
-            return SendResult(success=False, error=f"liberdusd unavailable: {_scrub_text(str(exc))}", retryable=True)
+            response = await self.client.post("/send-reactions", json=request, headers=self._auth_headers())
+            if getattr(response, "status_code", 200) >= 400:
+                logger.debug("Liberdus processing reaction rejected: %s", _error_message(response.json(), "reaction rejected"))
         except Exception as exc:
-            return SendResult(success=False, error=f"liberdusd send failed: {_scrub_text(str(exc))}", retryable=False)
+            logger.debug("Liberdus processing reaction failed: %s", _scrub_text(str(exc)))
 
     async def _poll_loop(self) -> None:
         while self.is_connected:
@@ -475,10 +723,32 @@ class LiberdusAdapter(BasePlatformAdapter):
                     continue
                 response = None
                 if self._message_handler is not None:
-                    response = await self._message_handler(message_event)
+                    await self._run_processing_hook("on_processing_start", message_event)
+                    processing_ok = False
+                    try:
+                        response = await self._message_handler(message_event)
+                        if response:
+                            send_result = await self.send(
+                                message_event.source.chat_id,
+                                str(response),
+                                reply_to=message_event.message_id,
+                            )
+                            processing_ok = bool(send_result.success)
+                        else:
+                            processing_ok = True
+                    except Exception:
+                        await self._run_processing_hook(
+                            "on_processing_complete",
+                            message_event,
+                            ProcessingOutcome.FAILURE,
+                        )
+                        raise
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        message_event,
+                        ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                    )
                 last_delivered_event_id = event_id
-                if response:
-                    await self.send(message_event.source.chat_id, str(response), reply_to=message_event.message_id)
             if last_delivered_event_id:
                 self._cursor_by_account[account_id] = last_delivered_event_id
                 await self._ack_event(account_id, last_delivered_event_id)
@@ -544,6 +814,7 @@ class LiberdusAdapter(BasePlatformAdapter):
             "capabilityClass": event.get("capabilityClass"),
             "policyMode": policy_mode,
             "replyAction": reply_action,
+            "lastReactionTarget": str(event.get("txid") or event.get("appReceiptId") or event.get("messageId") or event.get("eventId") or ""),
         }
 
         return MessageEvent(
