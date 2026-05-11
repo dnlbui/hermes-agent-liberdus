@@ -5,6 +5,7 @@ live Liberdus dev network and use sentinel strings (not real secrets) to verify
 that the adapter preserves the daemon secret boundary.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -71,11 +72,14 @@ class _FakeLiberdusClient:
         if path == "/events/ack":
             self.daemon.acks.append(dict(json or {}))
             return _FakeResponse(200, {"ok": True, "cursor": (json or {}).get("cursor")})
+        if path == "/send-reactions":
+            self.daemon.reaction_requests.append(dict(json or {}))
+            return _FakeResponse(200, {"ok": True, "accepted": True, "state": "accepted"})
         if path != "/send-requests":
             return _FakeResponse(404, {"ok": False, "error": {"code": "not_found"}})
         self.daemon.send_requests.append(dict(json or {}))
         if self.daemon.send_failure:
-            return _FakeResponse(502, self.daemon.send_failure)
+            return _FakeResponse(self.daemon.send_failure_status, self.daemon.send_failure)
         return _FakeResponse(
             200,
             {
@@ -100,10 +104,12 @@ class _FakeLiberdusDaemon:
     def __init__(self) -> None:
         self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
         self.send_requests: list[dict[str, Any]] = []
+        self.reaction_requests: list[dict[str, Any]] = []
         self.acks: list[dict[str, Any]] = []
         self.raise_on_get = False
         self.raise_on_post = False
         self.send_failure: dict[str, Any] | None = None
+        self.send_failure_status = 502
         self.health = {
             "ok": True,
             "service": "liberdusd",
@@ -272,6 +278,7 @@ async def test_fake_daemon_inbound_policy_mapping_dedupe_and_resume(monkeypatch)
     assert dbp_event.raw_message["reply"]["action"] == "send-message"
     assert test_event.raw_message["reply"]["action"] == "reply-test"
     assert "trusted full-access" in (dbp_event.channel_prompt or "")
+    assert "Tool use is disabled" not in (dbp_event.channel_prompt or "")
     assert "restricted chat-only" in (test_event.channel_prompt or "")
     assert "Tool use is disabled" in (test_event.channel_prompt or "")
     assert daemon.acks == [{"schemaVersion": 1, "accountId": "acct-general", "cursor": "evt-test-1"}]
@@ -281,6 +288,28 @@ async def test_fake_daemon_inbound_policy_mapping_dedupe_and_resume(monkeypatch)
     await adapter._poll_once()
     assert [event.message_id for event in delivered] == ["evt-dbp-1", "evt-test-1", "evt-dbp-2"]
     assert delivered[-1].source.chat_id == dbp_event.source.chat_id
+
+
+def test_liberdus_trusted_sessions_keep_tools_while_test_sessions_are_toolless():
+    from gateway.run import _apply_liberdus_session_tool_boundary
+    from gateway.session import SessionSource
+
+    trusted = SessionSource(
+        platform=Platform.LIBERDUS,
+        chat_id="liberdus:dm:acct:chat-hermesbot",
+        user_name="HermesBot",
+        chat_topic="full",
+    )
+    restricted = SessionSource(
+        platform=Platform.LIBERDUS,
+        chat_id="liberdus:dm:acct:chat-test",
+        user_name="test",
+        chat_topic="restricted-chat-only",
+    )
+    toolsets = ["file", "kanban", "terminal"]
+
+    assert _apply_liberdus_session_tool_boundary(trusted, toolsets) == toolsets
+    assert _apply_liberdus_session_tool_boundary(restricted, toolsets) == []
 
 
 @pytest.mark.asyncio
@@ -411,6 +440,41 @@ async def test_fake_daemon_outbound_uses_session_policy_actions(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_processing_lifecycle_sends_liberdus_reaction_controls(monkeypatch):
+    """Lifecycle hooks post web-client-v2-shaped reaction controls to liberdusd."""
+    from gateway.platforms.liberdus import LiberdusAdapter
+
+    daemon = _FakeLiberdusDaemon()
+    daemon.events = [_make_event("evt-dbp-1", "dbp", preview="dbp ping")]
+    _patch_http_client(monkeypatch, daemon)
+
+    adapter = LiberdusAdapter(_adapter_config())
+    delivered = []
+
+    async def handler(event):
+        delivered.append(event)
+        return None
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    await adapter._poll_once()
+    assert len(delivered) == 1
+
+    assert [request["reactMessage"] for request in daemon.reaction_requests] == ["👀", "✅"]
+    assert [request["reactAction"] for request in daemon.reaction_requests] == ["set", "set"]
+    assert all(request["reactId"] == "tx-evt-dbp-1" for request in daemon.reaction_requests)
+    assert daemon.reaction_requests[0]["schemaVersion"] == 1
+    assert daemon.reaction_requests[0]["accountId"] == "acct-general"
+    assert daemon.reaction_requests[0]["chatId"] == "chat-dbp"
+    assert daemon.reaction_requests[0]["contactId"] == "contact-dbp"
+    assert daemon.reaction_requests[0]["counterpartyProfile"] == "dbp"
+    assert daemon.reaction_requests[0]["clientContext"]["platform"] == "liberdus"
+    assert daemon.reaction_requests[0]["clientContext"]["lifecycle"] == "processing"
+    assert daemon.reaction_requests[0]["clientContext"]["replyToEventId"] == "evt-dbp-1"
+    _assert_no_forbidden_sentinels(daemon.reaction_requests)
+
+
+@pytest.mark.asyncio
 async def test_fake_daemon_send_failure_is_reported_without_secret_leakage(monkeypatch):
     """Daemon send failures become safe SendResult errors with secret-like fields scrubbed."""
     from gateway.platforms.liberdus import LiberdusAdapter
@@ -448,6 +512,93 @@ async def test_fake_daemon_send_failure_is_reported_without_secret_leakage(monke
 
 
 @pytest.mark.asyncio
+async def test_rejected_outbound_send_logs_safe_diagnostics(monkeypatch, caplog):
+    """Oversized daemon rejections are logged with identifiers and hashes, never full plaintext."""
+    from gateway.platforms.liberdus import LiberdusAdapter
+
+    daemon = _FakeLiberdusDaemon()
+    daemon.events = [_make_event("evt-dbp-1", "dbp", preview="dbp ping")]
+    daemon.send_failure_status = 413
+    daemon.send_failure = {
+        "ok": False,
+        "accepted": False,
+        "error": {"code": "message_too_large", "message": "message exceeds 4096 bytes"},
+    }
+    _patch_http_client(monkeypatch, daemon)
+
+    adapter = LiberdusAdapter(_adapter_config())
+
+    async def handler(_event):
+        return None
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    await adapter._poll_once()
+
+    rejected_message = "safe diagnostic preview " + ("x" * 500) + " SENTINEL_PRIVATE_KEY raw_tx_json={\"signedTx\":\"LEAK_RAW_TX\"}"
+    with caplog.at_level("WARNING", logger="gateway.platforms.liberdus"):
+        result = await adapter.send("liberdus:dm:acct-general:chat-dbp", rejected_message, reply_to="evt-dbp-1")
+
+    assert result.success is False
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Liberdus send request rejected" in log_text
+    assert "http_status=413" in log_text
+    assert "daemon_code=message_too_large" in log_text
+    assert "plaintext_bytes=" in log_text
+    assert f"plaintext_sha256={hashlib.sha256(rejected_message.encode('utf-8')).hexdigest()}" in log_text
+    assert "action=send-message" in log_text
+    assert "account_id=acct-general" in log_text
+    assert "chat_id=chat-dbp" in log_text
+    assert "contact_id=contact-dbp" in log_text
+    assert "safe diagnostic preview" in log_text
+    assert "SENTINEL_PRIVATE_KEY" not in log_text
+    assert "LEAK_RAW_TX" not in log_text
+    assert "x" * 500 not in log_text
+    _assert_no_forbidden_sentinels({"error": result.error, "raw_response": result.raw_response, "logs": log_text})
+
+
+@pytest.mark.asyncio
+async def test_long_outbound_replies_are_chunked_before_send_requests(monkeypatch):
+    """Liberdus replies over the web-client plaintext limit are split before POSTing."""
+    from gateway.platforms.liberdus import LIBERDUS_OUTBOUND_MESSAGE_MAX_BYTES, LiberdusAdapter
+
+    daemon = _FakeLiberdusDaemon()
+    daemon.events = [_make_event("evt-dbp-1", "dbp", preview="dbp ping")]
+    _patch_http_client(monkeypatch, daemon)
+
+    adapter = LiberdusAdapter(_adapter_config())
+
+    async def handler(_event):
+        return None
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    await adapter._poll_once()
+
+    long_message = "Intro line. " + ("chunk me please " * 120) + "✅ done"
+    result = await adapter.send("liberdus:dm:acct-general:chat-dbp", long_message, reply_to="evt-dbp-1")
+
+    assert result.success is True
+    send_requests = daemon.send_requests
+    assert len(send_requests) >= 2
+    assert all(len(request["message"].encode("utf-8")) <= LIBERDUS_OUTBOUND_MESSAGE_MAX_BYTES for request in send_requests)
+    assert [request["clientContext"]["chunk"]["index"] for request in send_requests] == list(range(1, len(send_requests) + 1))
+    assert {request["clientContext"]["chunk"]["total"] for request in send_requests} == {len(send_requests)}
+    assert {request["clientContext"]["chunk"]["originalPlaintextSha256"] for request in send_requests} == {
+        hashlib.sha256(long_message.encode("utf-8")).hexdigest()
+    }
+    assert len({request["clientContext"]["adapterRequestId"] for request in send_requests}) == len(send_requests)
+    assert send_requests[0]["message"].startswith(f"(1/{len(send_requests)})\n")
+    assert send_requests[-1]["message"].startswith(f"({len(send_requests)}/{len(send_requests)})\n")
+    reconstructed = " ".join(request["message"].split("\n", 1)[1].strip() for request in send_requests)
+    assert "Intro line." in reconstructed
+    assert "✅ done" in reconstructed
+    assert result.raw_response["ok"] is True
+    assert len(result.raw_response["chunks"]) == len(send_requests)
+    _assert_no_forbidden_sentinels(send_requests)
+
+
+@pytest.mark.asyncio
 async def test_missing_daemon_reports_disconnected_status(monkeypatch):
     """A missing local daemon fails closed and leaves the platform disconnected."""
     from gateway.platforms.liberdus import LiberdusAdapter
@@ -471,7 +622,7 @@ def test_env_overrides_enable_liberdus_only_with_local_api_and_dev_profile(monke
     monkeypatch.delenv("LIBERDUS_API_SOCKET", raising=False)
     monkeypatch.setenv("LIBERDUS_NETWORK_PROFILE", "dev")
     monkeypatch.setenv("LIBERDUS_API_TOKEN", "test-local-token")
-    monkeypatch.setenv("LIBERDUS_POLL_INTERVAL_MS", "2000")
+    monkeypatch.setenv("LIBERDUS_POLL_INTERVAL_MS", "500")
 
     config = GatewayConfig()
     _apply_env_overrides(config)
@@ -484,7 +635,7 @@ def test_env_overrides_enable_liberdus_only_with_local_api_and_dev_profile(monke
     assert liberdus_config.extra["api_socket"] is None
     assert liberdus_config.extra["network_profile"] == "dev"
     assert liberdus_config.extra["api_token"] == "test-local-token"
-    assert liberdus_config.extra["poll_interval_ms"] == 2000
+    assert liberdus_config.extra["poll_interval_ms"] == 500
 
 
 def test_env_overrides_accept_http_url_alias_and_allowlists(monkeypatch):

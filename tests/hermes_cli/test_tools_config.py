@@ -83,6 +83,17 @@ def test_get_platform_tools_default_telegram_includes_messaging():
     assert "messaging" in enabled
 
 
+def test_get_platform_tools_default_liberdus_matches_signal_core_access():
+    """Trusted Liberdus sessions should get the same core tools as Signal by default."""
+    signal_enabled = _get_platform_tools({}, "signal")
+    liberdus_enabled = _get_platform_tools({}, "liberdus")
+
+    assert liberdus_enabled == signal_enabled
+    assert "terminal" in liberdus_enabled
+    assert "file" in liberdus_enabled
+    assert "kanban" in liberdus_enabled
+
+
 def test_get_platform_tools_homeassistant_platform_keeps_homeassistant_toolset():
     enabled = _get_platform_tools({}, "homeassistant")
 
