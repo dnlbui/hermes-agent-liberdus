@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -36,8 +37,6 @@ _SUCCESS_REACTION = "✅"
 _FAILURE_REACTION = "❌"
 _CANCELLED_REACTION = "❌"
 
-_ALLOWED_PROFILES = {"dbp", "test"}
-_ALLOWED_POLICY_MODES = {"full", "restricted-chat-only"}
 _ALLOWED_DEV_ORIGINS = {"https://dev.liberdus.com:3030"}
 _EXACT_DEV_INJECT = "https://dev.liberdus.com:3030/inject"
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -111,16 +110,6 @@ def _configured_http_url() -> str | None:
     return http_url or api_url or None
 
 
-def _configured_counterparty_profiles() -> list[str] | None:
-    profiles = _split_allowlist(os.getenv("LIBERDUS_COUNTERPARTY_PROFILES"))
-    if not profiles:
-        return None
-    normalized = [profile.lower() for profile in profiles]
-    if any(profile not in _ALLOWED_PROFILES for profile in normalized):
-        return []
-    return normalized
-
-
 def _is_loopback_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -154,20 +143,6 @@ def _stable_adapter_request_id(session: dict[str, Any], action: str, message: st
         ]
     )
     return f"gw_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:32]}"
-
-
-def _liberdus_channel_prompt(profile: str, policy_mode: str) -> str:
-    if profile == "dbp" and policy_mode == "full":
-        return (
-            "Liberdus dev adapter policy: this message is from dbp, a trusted full-access "
-            "counterparty. Normal Hermes tools may be used when otherwise authorized."
-        )
-    if profile == "test" and policy_mode == "restricted-chat-only":
-        return (
-            "Liberdus dev adapter policy: this message is from test, a restricted chat-only "
-            "counterparty. Tool use is disabled for this turn; answer conversationally only."
-        )
-    return ""
 
 
 def _safe_payload(value: Any) -> Any:
@@ -384,9 +359,6 @@ def liberdus_env_config() -> Optional[dict[str, Any]]:
         return None
 
     account_labels = _split_allowlist(os.getenv("LIBERDUS_ACCOUNT_LABELS"))
-    counterparty_profiles = _configured_counterparty_profiles()
-    if counterparty_profiles == [] and os.getenv("LIBERDUS_COUNTERPARTY_PROFILES"):
-        return None
 
     poll_interval_ms = _coerce_int(
         os.getenv("LIBERDUS_POLL_INTERVAL_MS"),
@@ -409,8 +381,6 @@ def liberdus_env_config() -> Optional[dict[str, Any]]:
     }
     if account_labels:
         result["account_labels"] = account_labels
-    if counterparty_profiles:
-        result["counterparty_profiles"] = counterparty_profiles
     return result
 
 
@@ -439,13 +409,13 @@ class LiberdusAdapter(BasePlatformAdapter):
             maximum=MAX_EVENTS_PAGE_SIZE,
         )
         self.account_labels = _allowlist_set(extra.get("account_labels"))
-        self.counterparty_profiles = _allowlist_set(extra.get("counterparty_profiles")) or set(_ALLOWED_PROFILES)
         self.client: Any = None
         self._poll_task: asyncio.Task | None = None
         self._accounts: list[dict[str, Any]] = []
         self._cursor_by_account: dict[str, str | None] = {}
         self._seen_event_ids: set[str] = set()
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._event_stream_path: str | None = None
 
     async def connect(self) -> bool:
         if not self._validate_endpoint_config():
@@ -472,9 +442,14 @@ class LiberdusAdapter(BasePlatformAdapter):
             # accountId still work without synthesizing account identity.
             if not self._cursor_by_account:
                 self._cursor_by_account[""] = None
+            self._event_stream_path = self._extract_event_stream_path(status)
             self._mark_connected()
-            self._poll_task = asyncio.create_task(self._poll_loop())
-            logger.info("Liberdus adapter connected to local liberdusd endpoint")
+            if self._event_stream_path:
+                self._poll_task = asyncio.create_task(self._event_stream_loop())
+                logger.info("Liberdus adapter connected to local liberdusd endpoint using SSE event stream")
+            else:
+                self._poll_task = asyncio.create_task(self._poll_loop())
+                logger.info("Liberdus adapter connected to local liberdusd endpoint using polling")
             return True
         except Exception as exc:
             if self.client is not None:
@@ -536,12 +511,8 @@ class LiberdusAdapter(BasePlatformAdapter):
         action = session.get("replyAction")
         profile = session.get("counterpartyProfile")
         policy_mode = session.get("policyMode")
-        if profile == "dbp" and action != "send-message":
-            return SendResult(success=False, error="policy_denied: dbp requires send-message")
-        if profile == "test" and action != "reply-test":
-            return SendResult(success=False, error="restricted_action_denied: test requires reply-test")
-        if action not in {"send-message", "reply-test"}:
-            return SendResult(success=False, error="policy_denied: outbound action unavailable")
+        if session.get("replyAllowed") is not True or action != "send-message":
+            return SendResult(success=False, error="policy_denied: outbound send unavailable for this Liberdus chat")
 
         chunks = _split_liberdus_outbound_message(message)
         original_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
@@ -658,7 +629,7 @@ class LiberdusAdapter(BasePlatformAdapter):
         if not self.client or not self.is_connected:
             return
         session = self._sessions.get(str(event.source.chat_id))
-        if not session or session.get("policyMode") == "quarantine":
+        if not session or session.get("replyAllowed") is not True:
             return
         react_id = str(session.get("lastReactionTarget") or event.message_id or "").strip()
         if not react_id:
@@ -696,6 +667,90 @@ class LiberdusAdapter(BasePlatformAdapter):
                 logger.warning("Liberdus poll failed: %s", _scrub_text(str(exc)))
             await asyncio.sleep(self.poll_interval_ms / 1000.0)
 
+    async def _event_stream_loop(self) -> None:
+        """Prefer daemon SSE for low-latency local delivery, then degrade to polling if it breaks."""
+        while self.is_connected:
+            try:
+                await self._event_stream_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.info("Liberdus event stream unavailable; falling back to polling: %s", _scrub_text(str(exc)))
+                await self._poll_loop()
+                return
+            if self.is_connected:
+                logger.info("Liberdus event stream disconnected; falling back to polling after local poll interval")
+                await asyncio.sleep(self.poll_interval_ms / 1000.0)
+                await self._poll_loop()
+                return
+
+    async def _event_stream_once(self) -> None:
+        if not self.client or not self._event_stream_path:
+            return
+        # The daemon stream can be account-scoped.  If the daemon reported no
+        # accounts, keep the same global cursor behavior as the polling path.
+        account_ids = list(self._cursor_by_account.keys()) or [""]
+        if len(account_ids) == 1:
+            await self._event_stream_account_once(account_ids[0])
+            return
+        tasks = [asyncio.create_task(self._event_stream_account_once(account_id)) for account_id in account_ids]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _event_stream_account_once(self, account_id: str) -> None:
+        params: dict[str, Any] = {}
+        if account_id:
+            params["accountId"] = account_id
+        cursor = self._cursor_by_account.get(account_id)
+        if cursor:
+            params["after"] = cursor
+        path = self._event_stream_path or "/events/stream"
+        if params:
+            path = f"{path}?{urlencode(params)}"
+        async with self.client.stream("GET", path, headers=self._auth_headers(), timeout=None) as response:
+            response.raise_for_status()
+            frame: dict[str, list[str]] = {"data": []}
+            async for raw_line in response.aiter_lines():
+                line = raw_line.rstrip("\r")
+                if line == "":
+                    await self._handle_sse_frame(account_id, frame)
+                    frame = {"data": []}
+                    continue
+                if line.startswith(":"):
+                    continue
+                field, sep, value = line.partition(":")
+                if not sep:
+                    continue
+                if value.startswith(" "):
+                    value = value[1:]
+                if field == "data":
+                    frame.setdefault("data", []).append(value)
+                else:
+                    frame[field] = [value]
+            await self._handle_sse_frame(account_id, frame)
+
+    async def _handle_sse_frame(self, account_id: str, frame: dict[str, list[str]]) -> None:
+        data_lines = frame.get("data") or []
+        if not data_lines:
+            return
+        try:
+            payload = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError as exc:
+            logger.warning("Liberdus event stream sent invalid JSON frame: %s", _scrub_text(str(exc)))
+            return
+        if not isinstance(payload, dict):
+            return
+        raw_event = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+        delivered_event_id = await self._handle_raw_event(raw_event)
+        if delivered_event_id:
+            ack_account_id = str(raw_event.get("accountId") or account_id or "")
+            self._cursor_by_account[account_id] = delivered_event_id
+            await self._ack_event(ack_account_id, delivered_event_id)
+
     async def _poll_once(self) -> None:
         if not self.client:
             return
@@ -712,43 +767,9 @@ class LiberdusAdapter(BasePlatformAdapter):
                 continue
             last_delivered_event_id: str | None = None
             for raw_event in events:
-                if not isinstance(raw_event, dict):
-                    continue
-                event_id = str(raw_event.get("eventId") or "").strip()
-                if not event_id or event_id in self._seen_event_ids:
-                    continue
-                self._seen_event_ids.add(event_id)
-                message_event = self._event_to_message(raw_event)
-                if message_event is None:
-                    continue
-                response = None
-                if self._message_handler is not None:
-                    await self._run_processing_hook("on_processing_start", message_event)
-                    processing_ok = False
-                    try:
-                        response = await self._message_handler(message_event)
-                        if response:
-                            send_result = await self.send(
-                                message_event.source.chat_id,
-                                str(response),
-                                reply_to=message_event.message_id,
-                            )
-                            processing_ok = bool(send_result.success)
-                        else:
-                            processing_ok = True
-                    except Exception:
-                        await self._run_processing_hook(
-                            "on_processing_complete",
-                            message_event,
-                            ProcessingOutcome.FAILURE,
-                        )
-                        raise
-                    await self._run_processing_hook(
-                        "on_processing_complete",
-                        message_event,
-                        ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
-                    )
-                last_delivered_event_id = event_id
+                delivered_event_id = await self._handle_raw_event(raw_event)
+                if delivered_event_id:
+                    last_delivered_event_id = delivered_event_id
             if last_delivered_event_id:
                 self._cursor_by_account[account_id] = last_delivered_event_id
                 await self._ack_event(account_id, last_delivered_event_id)
@@ -756,6 +777,45 @@ class LiberdusAdapter(BasePlatformAdapter):
                 next_cursor = payload.get("nextCursor") if isinstance(payload, dict) else None
                 if next_cursor and next_cursor == cursor:
                     self._cursor_by_account[account_id] = str(next_cursor)
+
+    async def _handle_raw_event(self, raw_event: Any) -> str | None:
+        if not isinstance(raw_event, dict):
+            return None
+        event_id = str(raw_event.get("eventId") or "").strip()
+        if not event_id or event_id in self._seen_event_ids:
+            return None
+        self._seen_event_ids.add(event_id)
+        message_event = self._event_to_message(raw_event)
+        if message_event is None:
+            return None
+        response = None
+        if self._message_handler is not None:
+            await self._run_processing_hook("on_processing_start", message_event)
+            processing_ok = False
+            try:
+                response = await self._message_handler(message_event)
+                if response:
+                    send_result = await self.send(
+                        message_event.source.chat_id,
+                        str(response),
+                        reply_to=message_event.message_id,
+                    )
+                    processing_ok = bool(send_result.success)
+                else:
+                    processing_ok = True
+            except Exception:
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    message_event,
+                    ProcessingOutcome.FAILURE,
+                )
+                raise
+            await self._run_processing_hook(
+                "on_processing_complete",
+                message_event,
+                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+            )
+        return event_id
 
     def _account_allowed(self, payload: dict[str, Any]) -> bool:
         if not self.account_labels:
@@ -774,14 +834,10 @@ class LiberdusAdapter(BasePlatformAdapter):
         if str(event.get("visibility") or "normal") != "normal":
             return None
         profile = str(event.get("counterpartyProfile") or "").strip()
-        policy_mode = str(event.get("policyMode") or "").strip()
-        if profile not in _ALLOWED_PROFILES or profile not in self.counterparty_profiles or policy_mode not in _ALLOWED_POLICY_MODES:
-            return None
+        policy_mode = str(event.get("policyMode") or "allowed").strip() or "allowed"
         reply = event.get("reply") if isinstance(event.get("reply"), dict) else {}
         reply_action = str(reply.get("action") or "").strip()
-        if profile == "dbp" and (policy_mode != "full" or reply_action != "send-message"):
-            return None
-        if profile == "test" and (policy_mode != "restricted-chat-only" or reply_action != "reply-test"):
+        if reply.get("allowed") is not True or reply_action != "send-message":
             return None
 
         plaintext = event.get("plaintext") if isinstance(event.get("plaintext"), dict) else {}
@@ -813,6 +869,7 @@ class LiberdusAdapter(BasePlatformAdapter):
             "counterpartyDisplay": display,
             "capabilityClass": event.get("capabilityClass"),
             "policyMode": policy_mode,
+            "replyAllowed": True,
             "replyAction": reply_action,
             "lastReactionTarget": str(event.get("txid") or event.get("appReceiptId") or event.get("messageId") or event.get("eventId") or ""),
         }
@@ -832,7 +889,7 @@ class LiberdusAdapter(BasePlatformAdapter):
             ),
             raw_message=safe_event,
             message_id=str(event.get("eventId") or ""),
-            channel_prompt=_liberdus_channel_prompt(profile, policy_mode),
+            channel_prompt="",
             timestamp=_parse_timestamp(event.get("observedAt")),
         )
 
@@ -866,6 +923,27 @@ class LiberdusAdapter(BasePlatformAdapter):
         if not isinstance(payload, dict):
             raise RuntimeError("liberdusd returned non-object JSON")
         return payload
+
+    def _extract_event_stream_path(self, status: dict[str, Any]) -> str | None:
+        event_stream = status.get("eventStream") if isinstance(status.get("eventStream"), dict) else None
+        if not event_stream:
+            return None
+        transport = str(event_stream.get("transport") or event_stream.get("mode") or "").strip().lower()
+        if transport and transport != "sse":
+            return None
+        if event_stream.get("supported") is False:
+            return None
+        raw_path = event_stream.get("path") or event_stream.get("endpoint") or ""
+        path = str(raw_path or "").strip()
+        if path.startswith("GET "):
+            path = path.split(None, 1)[1].strip()
+        if not path:
+            path = "/events/stream"
+        if not path.startswith("/") or "?" in path:
+            return None
+        if path != "/events/stream":
+            return None
+        return path
 
     def _validate_endpoint_config(self) -> bool:
         if self.network_profile != "dev":

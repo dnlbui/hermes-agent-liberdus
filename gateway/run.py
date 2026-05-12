@@ -569,13 +569,7 @@ from gateway.restart import (
 
 
 def _apply_liberdus_session_tool_boundary(source: SessionSource, enabled_toolsets: list[str]) -> list[str]:
-    """Disable Hermes tools for restricted Liberdus test contacts at agent creation time."""
-    if source.platform != Platform.LIBERDUS:
-        return enabled_toolsets
-    policy = str(getattr(source, "chat_topic", None) or "").strip().lower()
-    user_name = str(getattr(source, "user_name", None) or "").strip().lower()
-    if policy == "restricted-chat-only" or user_name == "test":
-        return []
+    """Return configured tools unchanged; liberdusd owns Liberdus sender allow/deny policy."""
     return enabled_toolsets
 
 

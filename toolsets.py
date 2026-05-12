@@ -416,7 +416,7 @@ TOOLSETS = {
     },
 
     "hermes-liberdus": {
-        "description": "Liberdus bot toolset - devnet encrypted messaging platform (full access for trusted contacts; restricted contacts are tool-gated by Gateway policy)",
+        "description": "Liberdus bot toolset - devnet encrypted messaging platform; liberdusd enforces allowed senders and redacted send/reaction boundaries",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
