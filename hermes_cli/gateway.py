@@ -3617,7 +3617,8 @@ _PLATFORMS = [
             "2. Use the dev network only (liberdus.com/dev / dev.liberdus.com)",
             "3. Expose only the daemon's redacted local API; Hermes never receives keys, seeds, passphrases, or signed txs",
             "4. Configure exactly one local endpoint below: HTTP URL or Unix socket",
-            "5. Restart the gateway after changing Liberdus settings",
+            "5. Configure sender allowlists in liberdusd/CLI; Gateway only consumes daemon-normalized allowed events",
+            "6. Restart the gateway after changing Liberdus settings",
         ],
         "vars": [
             {"name": "LIBERDUS_ENABLED", "prompt": "Enable Liberdus? (true/false)", "password": False,
@@ -3634,8 +3635,6 @@ _PLATFORMS = [
              "help": "Optional Liberdus destination for scheduled results and notifications."},
             {"name": "LIBERDUS_ACCOUNT_LABELS", "prompt": "Allowed local account labels (comma-separated, optional)", "password": False,
              "help": "Optional allowlist of daemon-owned account labels or ids Hermes may expose, e.g. general."},
-            {"name": "LIBERDUS_COUNTERPARTY_PROFILES", "prompt": "Allowed counterparty profiles (comma-separated, default dbp,test)", "password": False,
-             "help": "Optional narrower allowlist of dev counterparty profiles to surface, e.g. dbp or dbp,test."},
             {"name": "LIBERDUS_POLL_INTERVAL_MS", "prompt": "Poll interval in milliseconds (default 15000)", "password": False,
              "help": "How often Hermes asks liberdusd for redacted inbound events."},
             {"name": "LIBERDUS_EVENTS_PAGE_SIZE", "prompt": "Events page size (default 50)", "password": False,

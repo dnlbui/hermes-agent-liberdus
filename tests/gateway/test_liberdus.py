@@ -5,6 +5,7 @@ live Liberdus dev network and use sentinel strings (not real secrets) to verify
 that the adapter preserves the daemon secret boundary.
 """
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -46,6 +47,31 @@ class _FakeResponse:
             )
 
 
+class _FakeSseStream:
+    def __init__(self, lines: list[str], *, status_code: int = 200) -> None:
+        self.lines = lines
+        self.status_code = status_code
+
+    async def __aenter__(self) -> "_FakeSseStream":
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=httpx.Request("GET", "http://127.0.0.1/events/stream"),
+                response=httpx.Response(self.status_code, json={"ok": False}),
+            )
+
+    async def aiter_lines(self):
+        for line in self.lines:
+            await asyncio.sleep(0)
+            yield line
+
+
 class _FakeLiberdusClient:
     def __init__(self, daemon: "_FakeLiberdusDaemon") -> None:
         self.daemon = daemon
@@ -64,6 +90,12 @@ class _FakeLiberdusClient:
         if path.startswith("/events"):
             return _FakeResponse(200, self.daemon.events_response(path))
         return _FakeResponse(404, {"ok": False, "error": {"code": "not_found"}})
+
+    def stream(self, method: str, path: str, **_kwargs: Any) -> _FakeSseStream:
+        self.daemon.requests.append(("STREAM", f"{method} {path}", None))
+        if self.daemon.raise_on_stream:
+            raise httpx.ConnectError("liberdusd event stream unavailable")
+        return _FakeSseStream(self.daemon.stream_lines, status_code=self.daemon.stream_status_code)
 
     async def post(self, path: str, json: dict[str, Any] | None = None, **_kwargs: Any) -> _FakeResponse:
         self.daemon.requests.append(("POST", path, json))
@@ -108,6 +140,9 @@ class _FakeLiberdusDaemon:
         self.acks: list[dict[str, Any]] = []
         self.raise_on_get = False
         self.raise_on_post = False
+        self.raise_on_stream = False
+        self.stream_status_code = 200
+        self.stream_lines: list[str] = []
         self.send_failure: dict[str, Any] | None = None
         self.send_failure_status = 502
         self.health = {
@@ -168,13 +203,16 @@ def _make_event(
     preview: str = "hello from liberdus",
     policy_mode: str | None = None,
     reply_action: str | None = None,
+    reply_allowed: bool | None = None,
     visibility: str = "normal",
     account_id: str = "acct-general",
     account_label: str = "general",
 ) -> dict[str, Any]:
     chat_id = chat_id or f"chat-{profile}"
-    policy_mode = policy_mode or ("full" if profile == "dbp" else "restricted-chat-only")
-    reply_action = reply_action or ("send-message" if profile == "dbp" else "reply-test")
+    policy_mode = policy_mode or "allowed"
+    reply_action = reply_action or "send-message"
+    if reply_allowed is None:
+        reply_allowed = visibility == "normal" and reply_action == "send-message"
     return {
         "schemaVersion": 1,
         "eventId": event_id,
@@ -186,7 +224,7 @@ def _make_event(
         "contactId": f"contact-{profile}",
         "counterpartyProfile": profile,
         "counterpartyDisplay": profile,
-        "capabilityClass": "owner/full" if profile == "dbp" else "restricted/chat",
+        "capabilityClass": "allowed",
         "policyMode": policy_mode,
         "network": "dev",
         "direction": "inbound",
@@ -207,7 +245,7 @@ def _make_event(
             "sha256": f"sha256-{event_id}",
             "lastDecryptedAt": "2026-05-10T00:00:00.000Z",
         },
-        "reply": {"allowed": visibility == "normal", "action": reply_action},
+        "reply": {"allowed": reply_allowed, "action": reply_action},
         "rawRefs": {"contentRedacted": True},
         # These sentinel values model a daemon/API regression.  The adapter must
         # not pass them into MessageEvent.text, source fields, errors, or logs.
@@ -222,6 +260,21 @@ def _assert_no_forbidden_sentinels(value: Any) -> None:
         assert sentinel not in encoded
 
 
+def _sse_lines(*events: dict[str, Any]) -> list[str]:
+    lines = [": liberdusd event stream ready", ""]
+    for event in events:
+        lines.extend([f"id: {event['eventId']}", "event: liberdus.event", f"data: {json.dumps(event)}", ""])
+    return lines
+
+
+async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("timed out waiting for condition")
+        await asyncio.sleep(0.01)
+
+
 def _patch_http_client(monkeypatch: pytest.MonkeyPatch, daemon: _FakeLiberdusDaemon) -> None:
     import gateway.platforms.liberdus as liberdus
 
@@ -229,14 +282,14 @@ def _patch_http_client(monkeypatch: pytest.MonkeyPatch, daemon: _FakeLiberdusDae
 
 
 @pytest.mark.asyncio
-async def test_fake_daemon_inbound_policy_mapping_dedupe_and_resume(monkeypatch):
-    """dbp/test become separate sessions; unknown and duplicate events are ignored."""
+async def test_fake_daemon_allowed_event_mapping_dedupe_and_resume(monkeypatch):
+    """Any daemon-normalized allowed sender becomes a Liberdus session; denied events are ignored."""
     from gateway.platforms.liberdus import LiberdusAdapter
 
     daemon = _FakeLiberdusDaemon()
     daemon.events = [
         _make_event("evt-dbp-1", "dbp", preview="dbp ping"),
-        _make_event("evt-test-1", "test", preview="test ping"),
+        _make_event("evt-alice-1", "alice", preview="alice ping"),
         _make_event(
             "evt-unknown-1",
             "unknown",
@@ -244,9 +297,16 @@ async def test_fake_daemon_inbound_policy_mapping_dedupe_and_resume(monkeypatch)
             preview="should stay quarantined",
             policy_mode="quarantine",
             reply_action="none",
+            reply_allowed=False,
             visibility="quarantine",
         ),
-        _make_event("evt-mismatch-1", "test", preview="mismatched policy must not route", policy_mode="full", reply_action="send-message"),
+        _make_event(
+            "evt-reply-disabled",
+            "bob",
+            preview="normal visibility but daemon denied reply",
+            reply_action="none",
+            reply_allowed=False,
+        ),
         _make_event("evt-dbp-1", "dbp", preview="duplicate should not emit twice"),
     ]
     _patch_http_client(monkeypatch, daemon)
@@ -261,36 +321,93 @@ async def test_fake_daemon_inbound_policy_mapping_dedupe_and_resume(monkeypatch)
     assert await adapter.connect() is True
     await adapter._poll_once()
 
-    assert [event.message_id for event in delivered] == ["evt-dbp-1", "evt-test-1"]
-    dbp_event, test_event = delivered
+    assert [event.message_id for event in delivered] == ["evt-dbp-1", "evt-alice-1"]
+    dbp_event, alice_event = delivered
     assert dbp_event.text == "dbp ping"
-    assert test_event.text == "test ping"
+    assert alice_event.text == "alice ping"
     assert dbp_event.source.platform.value == "liberdus"
-    assert test_event.source.platform.value == "liberdus"
+    assert alice_event.source.platform.value == "liberdus"
     assert dbp_event.source.chat_id == "liberdus:dm:acct-general:chat-dbp"
-    assert test_event.source.chat_id == "liberdus:dm:acct-general:chat-test"
+    assert alice_event.source.chat_id == "liberdus:dm:acct-general:chat-alice"
     assert dbp_event.source.chat_name == "Liberdus / dbp / general"
-    assert test_event.source.chat_name == "Liberdus / test / general"
+    assert alice_event.source.chat_name == "Liberdus / alice / general"
     assert dbp_event.source.user_name == "dbp"
-    assert test_event.source.user_name == "test"
-    assert dbp_event.raw_message["policyMode"] == "full"
-    assert test_event.raw_message["policyMode"] == "restricted-chat-only"
+    assert alice_event.source.user_name == "alice"
+    assert dbp_event.raw_message["policyMode"] == "allowed"
+    assert alice_event.raw_message["policyMode"] == "allowed"
     assert dbp_event.raw_message["reply"]["action"] == "send-message"
-    assert test_event.raw_message["reply"]["action"] == "reply-test"
-    assert "trusted full-access" in (dbp_event.channel_prompt or "")
-    assert "Tool use is disabled" not in (dbp_event.channel_prompt or "")
-    assert "restricted chat-only" in (test_event.channel_prompt or "")
-    assert "Tool use is disabled" in (test_event.channel_prompt or "")
-    assert daemon.acks == [{"schemaVersion": 1, "accountId": "acct-general", "cursor": "evt-test-1"}]
-    _assert_no_forbidden_sentinels([dbp_event, test_event])
+    assert alice_event.raw_message["reply"]["action"] == "send-message"
+    assert dbp_event.channel_prompt == ""
+    assert alice_event.channel_prompt == ""
+    assert daemon.acks == [{"schemaVersion": 1, "accountId": "acct-general", "cursor": "evt-alice-1"}]
+    _assert_no_forbidden_sentinels([dbp_event, alice_event])
 
     daemon.events.append(_make_event("evt-dbp-2", "dbp", preview="dbp resumed"))
     await adapter._poll_once()
-    assert [event.message_id for event in delivered] == ["evt-dbp-1", "evt-test-1", "evt-dbp-2"]
+    assert [event.message_id for event in delivered] == ["evt-dbp-1", "evt-alice-1", "evt-dbp-2"]
     assert delivered[-1].source.chat_id == dbp_event.source.chat_id
 
 
-def test_liberdus_trusted_sessions_keep_tools_while_test_sessions_are_toolless():
+@pytest.mark.asyncio
+async def test_adapter_uses_daemon_event_stream_before_polling(monkeypatch):
+    """When liberdusd advertises SSE, Gateway handles streamed events without waiting for the local poll interval."""
+    from gateway.platforms.liberdus import LiberdusAdapter
+
+    daemon = _FakeLiberdusDaemon()
+    daemon.status["eventStream"] = {"supported": True, "path": "/events/stream", "mode": "sse"}
+    daemon.stream_lines = _sse_lines(_make_event("evt-stream-dbp", "dbp", preview="stream delivered"))
+    _patch_http_client(monkeypatch, daemon)
+
+    adapter = LiberdusAdapter(_adapter_config(poll_interval_ms=5000))
+    delivered = []
+
+    async def handler(event):
+        delivered.append(event)
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    try:
+        await _wait_for(lambda: len(delivered) == 1)
+        assert delivered[0].message_id == "evt-stream-dbp"
+        assert delivered[0].text == "stream delivered"
+        assert any(request[0] == "STREAM" and "/events/stream" in request[1] for request in daemon.requests)
+        assert not any(request[0] == "GET" and request[1].startswith("/events?") for request in daemon.requests)
+        assert daemon.acks == [{"schemaVersion": 1, "accountId": "acct-general", "cursor": "evt-stream-dbp"}]
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_adapter_falls_back_to_polling_when_event_stream_unavailable(monkeypatch, caplog):
+    """A broken local SSE stream is not fatal; the adapter logs fallback and resumes existing polling."""
+    from gateway.platforms.liberdus import LiberdusAdapter
+
+    daemon = _FakeLiberdusDaemon()
+    daemon.status["eventStream"] = {"supported": True, "path": "/events/stream", "mode": "sse"}
+    daemon.raise_on_stream = True
+    daemon.events = [_make_event("evt-polled-after-stream-failure", "dbp", preview="fallback delivered")]
+    _patch_http_client(monkeypatch, daemon)
+
+    adapter = LiberdusAdapter(_adapter_config(poll_interval_ms=20))
+    delivered = []
+
+    async def handler(event):
+        delivered.append(event)
+
+    adapter.set_message_handler(handler)
+    caplog.set_level("INFO")
+    assert await adapter.connect() is True
+    try:
+        await _wait_for(lambda: len(delivered) == 1)
+        assert delivered[0].message_id == "evt-polled-after-stream-failure"
+        assert any(request[0] == "STREAM" and "/events/stream" in request[1] for request in daemon.requests)
+        assert any(request[0] == "GET" and request[1].startswith("/events?") for request in daemon.requests)
+        assert "falling back to polling" in caplog.text
+    finally:
+        await adapter.disconnect()
+
+
+def test_liberdus_sessions_keep_configured_tools_without_sender_tier_gating():
     from gateway.run import _apply_liberdus_session_tool_boundary
     from gateway.session import SessionSource
 
@@ -298,9 +415,9 @@ def test_liberdus_trusted_sessions_keep_tools_while_test_sessions_are_toolless()
         platform=Platform.LIBERDUS,
         chat_id="liberdus:dm:acct:chat-hermesbot",
         user_name="HermesBot",
-        chat_topic="full",
+        chat_topic="allowed",
     )
-    restricted = SessionSource(
+    formerly_restricted = SessionSource(
         platform=Platform.LIBERDUS,
         chat_id="liberdus:dm:acct:chat-test",
         user_name="test",
@@ -309,12 +426,12 @@ def test_liberdus_trusted_sessions_keep_tools_while_test_sessions_are_toolless()
     toolsets = ["file", "kanban", "terminal"]
 
     assert _apply_liberdus_session_tool_boundary(trusted, toolsets) == toolsets
-    assert _apply_liberdus_session_tool_boundary(restricted, toolsets) == []
+    assert _apply_liberdus_session_tool_boundary(formerly_restricted, toolsets) == toolsets
 
 
 @pytest.mark.asyncio
-async def test_configured_account_and_counterparty_allowlists_gate_events(monkeypatch):
-    """Operator allowlists can narrow daemon-visible dbp/test/account events before Hermes sees them."""
+async def test_configured_account_allowlist_gates_events_without_sender_tiers(monkeypatch):
+    """Gateway may narrow daemon-owned accounts, but sender allow/deny stays in liberdusd."""
     from gateway.platforms.liberdus import LiberdusAdapter
 
     daemon = _FakeLiberdusDaemon()
@@ -339,7 +456,6 @@ async def test_configured_account_and_counterparty_allowlists_gate_events(monkey
     adapter = LiberdusAdapter(
         _adapter_config(
             account_labels=["general"],
-            counterparty_profiles=["dbp"],
         )
     )
     delivered = []
@@ -351,10 +467,11 @@ async def test_configured_account_and_counterparty_allowlists_gate_events(monkey
     assert await adapter.connect() is True
     await adapter._poll_once()
 
-    assert [event.message_id for event in delivered] == ["evt-dbp-allowed"]
+    assert [event.message_id for event in delivered] == ["evt-dbp-allowed", "evt-test-filtered"]
     assert list(adapter._cursor_by_account.keys()) == ["acct-general"]
     assert delivered[0].source.chat_id == "liberdus:dm:acct-general:chat-dbp"
-    assert daemon.acks == [{"schemaVersion": 1, "accountId": "acct-general", "cursor": "evt-dbp-allowed"}]
+    assert delivered[1].source.chat_id == "liberdus:dm:acct-general:chat-test"
+    assert daemon.acks == [{"schemaVersion": 1, "accountId": "acct-general", "cursor": "evt-test-filtered"}]
 
 
 @pytest.mark.asyncio
@@ -386,8 +503,8 @@ async def test_cursor_initializes_from_daemon_status_and_acks_after_delivery(mon
 
 
 @pytest.mark.asyncio
-async def test_fake_daemon_outbound_uses_session_policy_actions(monkeypatch):
-    """Replies route through /send-requests and force dbp/test actions from daemon metadata."""
+async def test_fake_daemon_outbound_uses_simple_send_message_action(monkeypatch):
+    """Replies route through /send-requests with the daemon-owned allowed send action."""
     from gateway.platforms.liberdus import LiberdusAdapter
 
     daemon = _FakeLiberdusDaemon()
@@ -415,7 +532,7 @@ async def test_fake_daemon_outbound_uses_session_policy_actions(monkeypatch):
     assert duplicate_dbp_result.success is True
     assert dbp_result.message_id == "safe-dev-handle-123"
     assert test_result.message_id == "safe-dev-handle-123"
-    assert [request["action"] for request in daemon.send_requests] == ["send-message", "reply-test", "send-message"]
+    assert [request["action"] for request in daemon.send_requests] == ["send-message", "send-message", "send-message"]
     assert daemon.send_requests[0]["schemaVersion"] == 1
     assert daemon.send_requests[0]["accountId"] == "acct-general"
     assert daemon.send_requests[0]["chatId"] == "chat-dbp"
@@ -425,7 +542,7 @@ async def test_fake_daemon_outbound_uses_session_policy_actions(monkeypatch):
     assert daemon.send_requests[0]["message"] == "hello dbp"
     assert daemon.send_requests[0]["clientContext"]["platform"] == "liberdus"
     assert daemon.send_requests[0]["clientContext"]["replyToEventId"] == "evt-dbp-1"
-    assert daemon.send_requests[0]["clientContext"]["policyMode"] == "full"
+    assert daemon.send_requests[0]["clientContext"]["policyMode"] == "allowed"
     assert daemon.send_requests[0]["clientContext"].get("adapterRequestId")
     assert (
         daemon.send_requests[2]["clientContext"]["adapterRequestId"]
@@ -435,7 +552,7 @@ async def test_fake_daemon_outbound_uses_session_policy_actions(monkeypatch):
     assert daemon.send_requests[1]["chatId"] == "chat-test"
     assert daemon.send_requests[1]["contactId"] == "contact-test"
     assert daemon.send_requests[1]["counterpartyProfile"] == "test"
-    assert daemon.send_requests[1]["clientContext"]["policyMode"] == "restricted-chat-only"
+    assert daemon.send_requests[1]["clientContext"]["policyMode"] == "allowed"
     _assert_no_forbidden_sentinels(daemon.send_requests)
 
 
@@ -638,8 +755,8 @@ def test_env_overrides_enable_liberdus_only_with_local_api_and_dev_profile(monke
     assert liberdus_config.extra["poll_interval_ms"] == 500
 
 
-def test_env_overrides_accept_http_url_alias_and_allowlists(monkeypatch):
-    """Final env contract supports LIBERDUS_HTTP_URL plus account/counterparty gates."""
+def test_env_overrides_accept_http_url_alias_and_account_labels(monkeypatch):
+    """Final env contract supports LIBERDUS_HTTP_URL while sender allowlists stay daemon-owned."""
     monkeypatch.setenv("LIBERDUS_ENABLED", "true")
     monkeypatch.delenv("LIBERDUS_API_URL", raising=False)
     monkeypatch.setenv("LIBERDUS_HTTP_URL", "http://localhost:9484")
@@ -647,7 +764,8 @@ def test_env_overrides_accept_http_url_alias_and_allowlists(monkeypatch):
     monkeypatch.setenv("LIBERDUS_NETWORK_PROFILE", "dev")
     monkeypatch.setenv("LIBERDUS_DAEMON_API_TOKEN", "daemon-local-token")
     monkeypatch.setenv("LIBERDUS_ACCOUNT_LABELS", "general, work")
-    monkeypatch.setenv("LIBERDUS_COUNTERPARTY_PROFILES", "dbp")
+    monkeypatch.setenv("LIBERDUS_ALLOWED_SENDERS", "dbp")
+    monkeypatch.setenv("LIBERDUS_COUNTERPARTY_PROFILES", "test")
 
     config = GatewayConfig()
     _apply_env_overrides(config)
@@ -655,7 +773,8 @@ def test_env_overrides_accept_http_url_alias_and_allowlists(monkeypatch):
     liberdus_config = config.platforms[Platform("liberdus")]
     assert liberdus_config.extra["api_url"] == "http://localhost:9484"
     assert liberdus_config.extra["account_labels"] == ["general", "work"]
-    assert liberdus_config.extra["counterparty_profiles"] == ["dbp"]
+    assert "counterparty_profiles" not in liberdus_config.extra
+    assert "allowed_senders" not in liberdus_config.extra
     assert liberdus_config.extra["api_token"] == "daemon-local-token"
 
 
@@ -696,11 +815,11 @@ def test_connected_platforms_require_exactly_one_local_dev_endpoint():
     assert platform not in wrong_profile.get_connected_platforms()
 
 
-def test_restricted_liberdus_sources_disable_agent_toolsets():
+def test_liberdus_sources_preserve_agent_toolsets_for_allowed_daemon_events():
     from gateway.run import _apply_liberdus_session_tool_boundary
     from gateway.session import SessionSource
 
-    restricted = SessionSource(
+    formerly_restricted = SessionSource(
         platform=Platform("liberdus"),
         user_id="contact-test",
         user_name="test",
@@ -712,10 +831,10 @@ def test_restricted_liberdus_sources_disable_agent_toolsets():
         user_id="contact-dbp",
         user_name="dbp",
         chat_id="liberdus:dm:acct-general:chat-dbp",
-        chat_topic="full",
+        chat_topic="allowed",
     )
 
-    assert _apply_liberdus_session_tool_boundary(restricted, ["terminal", "web"]) == []
+    assert _apply_liberdus_session_tool_boundary(formerly_restricted, ["terminal", "web"]) == ["terminal", "web"]
     assert _apply_liberdus_session_tool_boundary(trusted, ["terminal", "web"]) == ["terminal", "web"]
 
 
